@@ -2,96 +2,152 @@
 import streamlit as st
 import pandas as pd
 import time
+import uuid
 from database import save_to_db, get_chat_history, get_db_count, clear_db
 from llm import generate_response
 from data import create_sample_evaluation_data
 from metrics import get_metrics_descriptions
 
-# --- チャットページのUI ---
-def display_chat_page(pipe):
-    """チャットページのUIを表示する"""
-    st.subheader("質問を入力してください")
-    user_question = st.text_area("質問", key="question_input", height=100, value=st.session_state.get("current_question", ""))
-    submit_button = st.button("質問を送信")
+def initialize_chat_session():
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "current_feedback_message_id" not in st.session_state:
+        st.session_state.current_feedback_message_id = None
 
-    # セッション状態の初期化（安全のため）
-    if "current_question" not in st.session_state:
-        st.session_state.current_question = ""
-    if "current_answer" not in st.session_state:
-        st.session_state.current_answer = ""
-    if "response_time" not in st.session_state:
-        st.session_state.response_time = 0.0
-    if "feedback_given" not in st.session_state:
-        st.session_state.feedback_given = False
+def display_message_with_feedback(msg):
+    if msg["role"] == "user":
+        with st.chat_message("user"):
+            st.markdown(msg["content"])
+    elif msg["role"] == "assistant":
+        with st.chat_message("assistant"):
+            st.markdown(msg["content"])
+            if 'response_time' in msg:
+                st.caption(f"応答時間: {msg.get('response_time', 0.0):.2f}秒")
 
-    # 質問が送信された場合
-    if submit_button and user_question:
-        st.session_state.current_question = user_question
-        st.session_state.current_answer = "" # 回答をリセット
-        st.session_state.feedback_given = False # フィードバック状態もリセット
+            if not msg.get("feedback_submitted", False):
+                feedback_cols = st.columns([1, 1, 1, 5])
 
-        with st.spinner("モデルが回答を生成中..."):
-            answer, response_time = generate_response(pipe, user_question)
-            st.session_state.current_answer = answer
-            st.session_state.response_time = response_time
-            # ここでrerunすると回答とフィードバックが一度に表示される
+                with feedback_cols[0]:
+                    if st.button("👍", key=f"thumb_up_{msg['id']}", help="この回答は良かった"):
+                        submit_feedback(
+                            message_id=msg['id'],
+                            accuracy_label="正確",
+                            feedback_comment="👍 良かった (簡易フィードバック)",
+                            correct_answer_text=""
+                        )
+                        st.rerun()
+                with feedback_cols[1]:
+                    if st.button("👎", key=f"thumb_down_{msg['id']}", help="この回答は改善が必要"):
+                        submit_feedback(
+                            message_id=msg['id'],
+                            accuracy_label="不正確",
+                            feedback_comment="👎 改善が必要 (簡易フィードバック)",
+                            correct_answer_text=""
+                        )
+                        st.rerun()
+                with feedback_cols[2]:
+                    if st.button("詳細", key=f"detail_feedback_btn_{msg['id']}", help="詳細なフィードバックを行う"):
+                        st.session_state.current_feedback_message_id = msg['id']
+                        st.rerun()
+            else:
+                st.success("✔️ フィードバック送信済み")
+
+def display_and_process_detailed_feedback(message_id):
+    msg_to_feedback = next((m for m in st.session_state.messages if m['id'] == message_id), None)
+    if not msg_to_feedback:
+        st.error("フィードバック対象のメッセージが見つかりません。")
+        st.session_state.current_feedback_message_id = None
+        return
+
+    with st.form(key=f"feedback_form_{message_id}"):
+        st.markdown(f"##### 「{msg_to_feedback['content'][:50]}...」への詳細フィードバック")
+        feedback_options = ["正確", "部分的に正確", "不正確"]
+        feedback_accuracy = st.radio(
+            "回答の評価:",
+            feedback_options,
+            index=0,
+            key=f"feedback_radio_{message_id}",
+            horizontal=True
+        )
+        correct_answer_text = st.text_area(
+            "より正確な回答（任意）:",
+            key=f"correct_answer_input_{message_id}",
+            height=100
+        )
+        feedback_comment_text = st.text_area(
+            "コメント（任意）:",
+            key=f"feedback_comment_input_{message_id}",
+            height=100
+        )
+        submitted = st.form_submit_button("フィードバックを送信")
+
+        if submitted:
+            submit_feedback(
+                message_id=message_id,
+                accuracy_label=feedback_accuracy,
+                feedback_comment=feedback_comment_text,
+                correct_answer_text=correct_answer_text
+            )
+            st.session_state.current_feedback_message_id = None
             st.rerun()
 
-    # 回答が表示されるべきか判断 (質問があり、回答が生成済みで、まだフィードバックされていない)
-    if st.session_state.current_question and st.session_state.current_answer:
-        st.subheader("回答:")
-        st.markdown(st.session_state.current_answer) # Markdownで表示
-        st.info(f"応答時間: {st.session_state.response_time:.2f}秒")
+def submit_feedback(message_id, accuracy_label, feedback_comment, correct_answer_text):
+    msg_to_feedback = next((m for m in st.session_state.messages if m['id'] == message_id), None)
+    if not msg_to_feedback:
+        st.error("フィードバック対象のメッセージが見つかりません。")
+        return
 
-        # フィードバックフォームを表示 (まだフィードバックされていない場合)
-        if not st.session_state.feedback_given:
-            display_feedback_form()
-        else:
-             # フィードバック送信済みの場合、次の質問を促すか、リセットする
-             if st.button("次の質問へ"):
-                  # 状態をリセット
-                  st.session_state.current_question = ""
-                  st.session_state.current_answer = ""
-                  st.session_state.response_time = 0.0
-                  st.session_state.feedback_given = False
-                  st.rerun() # 画面をクリア
+    is_correct_value = 1.0 if accuracy_label == "正確" else (0.5 if accuracy_label == "部分的に正確" else 0.0)
+    combined_feedback_text = f"{accuracy_label}"
+    if feedback_comment:
+        combined_feedback_text += f": {feedback_comment}"
 
+    save_to_db(
+        question=msg_to_feedback.get("original_question_for_assistant", "N/A"),
+        answer=msg_to_feedback['content'],
+        feedback=combined_feedback_text,
+        correct_answer=correct_answer_text,
+        is_correct=is_correct_value,
+        response_time=msg_to_feedback.get('response_time', 0.0)
+    )
+    msg_to_feedback["feedback_submitted"] = True
+    st.success("フィードバックが保存されました！")
 
-def display_feedback_form():
-    """フィードバック入力フォームを表示する"""
-    with st.form("feedback_form"):
-        st.subheader("フィードバック")
-        feedback_options = ["正確", "部分的に正確", "不正確"]
-        # label_visibility='collapsed' でラベルを隠す
-        feedback = st.radio("回答の評価", feedback_options, key="feedback_radio", label_visibility='collapsed', horizontal=True)
-        correct_answer = st.text_area("より正確な回答（任意）", key="correct_answer_input", height=100)
-        feedback_comment = st.text_area("コメント（任意）", key="feedback_comment_input", height=100)
-        submitted = st.form_submit_button("フィードバックを送信")
-        if submitted:
-            # フィードバックをデータベースに保存
-            is_correct = 1.0 if feedback == "正確" else (0.5 if feedback == "部分的に正確" else 0.0)
-            # コメントがない場合でも '正確' などの評価はfeedbackに含まれるようにする
-            combined_feedback = f"{feedback}"
-            if feedback_comment:
-                combined_feedback += f": {feedback_comment}"
+def display_chat_page(pipe):
+    initialize_chat_session()
+    st.subheader("AIチャット")
 
-            save_to_db(
-                st.session_state.current_question,
-                st.session_state.current_answer,
-                combined_feedback,
-                correct_answer,
-                is_correct,
-                st.session_state.response_time
-            )
-            st.session_state.feedback_given = True
-            st.success("フィードバックが保存されました！")
-            # フォーム送信後に状態をリセットしない方が、ユーザーは結果を確認しやすいかも
-            # 必要ならここでリセットして st.rerun()
-            st.rerun() # フィードバックフォームを消すために再実行
+    for msg in st.session_state.messages:
+        display_message_with_feedback(msg)
 
-# --- 履歴閲覧ページのUI ---
+    if st.session_state.current_feedback_message_id:
+        with st.expander("詳細フィードバック入力", expanded=True):
+             display_and_process_detailed_feedback(st.session_state.current_feedback_message_id)
+             if st.button("詳細フィードバックを閉じる", key=f"close_detail_fb_form_{st.session_state.current_feedback_message_id}"):
+                 st.session_state.current_feedback_message_id = None
+                 st.rerun()
+
+    user_prompt = st.chat_input("メッセージを入力してください...")
+
+    if user_prompt:
+        user_msg_id = str(uuid.uuid4())
+        st.session_state.messages.append({"id": user_msg_id, "role": "user", "content": user_prompt})
+
+        with st.spinner("AIが考えています..."):
+            ai_response_content, response_time_val = generate_response(pipe, user_prompt)
+
+        ai_msg_id = str(uuid.uuid4())
+        st.session_state.messages.append({
+            "id": ai_msg_id,
+            "role": "assistant",
+            "content": ai_response_content,
+            "response_time": response_time_val,
+            "feedback_submitted": False,
+            "original_question_for_assistant": user_prompt
+        })
+        st.rerun()
+
 def display_history_page():
-    """履歴閲覧ページのUIを表示する"""
     st.subheader("チャット履歴と評価指標")
     history_df = get_chat_history()
 
@@ -99,35 +155,19 @@ def display_history_page():
         st.info("まだチャット履歴がありません。")
         return
 
-    # タブでセクションを分ける
     tab1, tab2 = st.tabs(["履歴閲覧", "評価指標分析"])
-
     with tab1:
         display_history_list(history_df)
-
     with tab2:
         display_metrics_analysis(history_df)
 
 def display_history_list(history_df):
-    """履歴リストを表示する"""
     st.write("#### 履歴リスト")
-    # 表示オプション
-    filter_options = {
-        "すべて表示": None,
-        "正確なもののみ": 1.0,
-        "部分的に正確なもののみ": 0.5,
-        "不正確なもののみ": 0.0
-    }
-    display_option = st.radio(
-        "表示フィルタ",
-        options=filter_options.keys(),
-        horizontal=True,
-        label_visibility="collapsed" # ラベル非表示
-    )
+    filter_options = {"すべて表示": None, "正確なもののみ": 1.0, "部分的に正確なもののみ": 0.5, "不正確なもののみ": 0.0}
+    display_option = st.radio("表示フィルタ", options=list(filter_options.keys()), horizontal=True, label_visibility="collapsed", key="history_filter_radio")
 
     filter_value = filter_options[display_option]
     if filter_value is not None:
-        # is_correctがNaNの場合を考慮
         filtered_df = history_df[history_df["is_correct"].notna() & (history_df["is_correct"] == filter_value)]
     else:
         filtered_df = history_df
@@ -136,156 +176,110 @@ def display_history_list(history_df):
         st.info("選択した条件に一致する履歴はありません。")
         return
 
-    # ページネーション
     items_per_page = 5
     total_items = len(filtered_df)
     total_pages = (total_items + items_per_page - 1) // items_per_page
-    current_page = st.number_input('ページ', min_value=1, max_value=total_pages, value=1, step=1)
+    total_pages = max(1, total_pages)
+    current_page = st.number_input('ページ', min_value=1, max_value=total_pages, value=1, step=1, key="history_page_num_input")
 
     start_idx = (current_page - 1) * items_per_page
     end_idx = start_idx + items_per_page
     paginated_df = filtered_df.iloc[start_idx:end_idx]
 
-
     for i, row in paginated_df.iterrows():
-        with st.expander(f"{row['timestamp']} - Q: {row['question'][:50] if row['question'] else 'N/A'}..."):
-            st.markdown(f"**Q:** {row['question']}")
-            st.markdown(f"**A:** {row['answer']}")
-            st.markdown(f"**Feedback:** {row['feedback']}")
-            if row['correct_answer']:
+        q_text = str(row['question']) if pd.notna(row['question']) else 'N/A'
+        with st.expander(f"{row['timestamp']} - Q: {q_text[:50]}..."):
+            st.markdown(f"**Q:** {q_text}")
+            st.markdown(f"**A:** {str(row['answer']) if pd.notna(row['answer']) else 'N/A'}")
+            st.markdown(f"**Feedback:** {str(row['feedback']) if pd.notna(row['feedback']) else 'N/A'}")
+            if pd.notna(row['correct_answer']) and row['correct_answer']:
                 st.markdown(f"**Correct A:** {row['correct_answer']}")
-
-            # 評価指標の表示
             st.markdown("---")
-            cols = st.columns(3)
-            cols[0].metric("正確性スコア", f"{row['is_correct']:.1f}")
-            cols[1].metric("応答時間(秒)", f"{row['response_time']:.2f}")
-            cols[2].metric("単語数", f"{row['word_count']}")
+            m_cols = st.columns(3)
+            m_cols[0].metric("正確性", f"{row['is_correct']:.1f}" if pd.notna(row['is_correct']) else "-")
+            m_cols[1].metric("応答時間(s)", f"{row['response_time']:.2f}" if pd.notna(row['response_time']) else "-")
+            m_cols[2].metric("単語数", f"{int(row['word_count'])}" if pd.notna(row['word_count']) else "-")
+            m_cols_2 = st.columns(3)
+            m_cols_2[0].metric("BLEU", f"{row['bleu_score']:.4f}" if pd.notna(row['bleu_score']) else "-")
+            m_cols_2[1].metric("類似度", f"{row['similarity_score']:.4f}" if pd.notna(row['similarity_score']) else "-")
+            m_cols_2[2].metric("関連性", f"{row['relevance_score']:.4f}" if pd.notna(row['relevance_score']) else "-")
 
-            cols = st.columns(3)
-            # NaNの場合はハイフン表示
-            cols[0].metric("BLEU", f"{row['bleu_score']:.4f}" if pd.notna(row['bleu_score']) else "-")
-            cols[1].metric("類似度", f"{row['similarity_score']:.4f}" if pd.notna(row['similarity_score']) else "-")
-            cols[2].metric("関連性", f"{row['relevance_score']:.4f}" if pd.notna(row['relevance_score']) else "-")
-
-    st.caption(f"{total_items} 件中 {start_idx+1} - {min(end_idx, total_items)} 件を表示")
-
+    st.caption(f"{total_items} 件中 {start_idx+1 if total_items > 0 else 0} - {min(end_idx, total_items)} 件を表示")
 
 def display_metrics_analysis(history_df):
-    """評価指標の分析結果を表示する"""
     st.write("#### 評価指標の分析")
-
-    # is_correct が NaN のレコードを除外して分析
-    analysis_df = history_df.dropna(subset=['is_correct'])
+    analysis_df = history_df.dropna(subset=['is_correct']).copy()
     if analysis_df.empty:
         st.warning("分析可能な評価データがありません。")
         return
 
     accuracy_labels = {1.0: '正確', 0.5: '部分的に正確', 0.0: '不正確'}
-    analysis_df['正確性'] = analysis_df['is_correct'].map(accuracy_labels)
+    analysis_df.loc[:, '正確性ラベル'] = analysis_df['is_correct'].map(accuracy_labels)
 
-    # 正確性の分布
     st.write("##### 正確性の分布")
-    accuracy_counts = analysis_df['正確性'].value_counts()
-    if not accuracy_counts.empty:
-        st.bar_chart(accuracy_counts)
-    else:
-        st.info("正確性データがありません。")
+    if '正確性ラベル' in analysis_df.columns:
+        accuracy_counts = analysis_df['正確性ラベル'].value_counts()
+        if not accuracy_counts.empty: st.bar_chart(accuracy_counts)
+        else: st.info("正確性データがありません。")
+    else: st.info("正確性ラベルカラムが分析データにありません。")
 
-    # 応答時間と他の指標の関係
     st.write("##### 応答時間とその他の指標の関係")
     metric_options = ["bleu_score", "similarity_score", "relevance_score", "word_count"]
-    # 利用可能な指標のみ選択肢に含める
     valid_metric_options = [m for m in metric_options if m in analysis_df.columns and analysis_df[m].notna().any()]
 
     if valid_metric_options:
-        metric_option = st.selectbox(
-            "比較する評価指標を選択",
-            valid_metric_options,
-            key="metric_select"
-        )
+        selected_metric = st.selectbox("比較する評価指標を選択", valid_metric_options, key="analysis_metric_selectbox")
+        plot_df = analysis_df[['response_time', selected_metric, '正確性ラベル']].dropna()
+        if not plot_df.empty:
+            st.scatter_chart(plot_df, x='response_time', y=selected_metric, color='正確性ラベル')
+        else: st.info(f"選択された指標 ({selected_metric}) と応答時間の有効なデータがありません。")
+    else: st.info("応答時間と比較できる指標データがありません。")
 
-        chart_data = analysis_df[['response_time', metric_option, '正確性']].dropna() # NaNを除外
-        if not chart_data.empty:
-             st.scatter_chart(
-                chart_data,
-                x='response_time',
-                y=metric_option,
-                color='正確性',
-            )
-        else:
-            st.info(f"選択された指標 ({metric_option}) と応答時間の有効なデータがありません。")
-
-    else:
-        st.info("応答時間と比較できる指標データがありません。")
-
-
-    # 全体の評価指標の統計
     st.write("##### 評価指標の統計")
     stats_cols = ['response_time', 'bleu_score', 'similarity_score', 'word_count', 'relevance_score']
-    valid_stats_cols = [c for c in stats_cols if c in analysis_df.columns and analysis_df[c].notna().any()]
+    valid_stats_cols = [
+        c for c in stats_cols
+        if c in analysis_df.columns and pd.api.types.is_numeric_dtype(analysis_df[c]) and analysis_df[c].notna().any()
+    ]
     if valid_stats_cols:
-        metrics_stats = analysis_df[valid_stats_cols].describe()
-        st.dataframe(metrics_stats)
-    else:
-        st.info("統計情報を計算できる評価指標データがありません。")
+        st.dataframe(analysis_df[valid_stats_cols].describe())
+    else: st.info("統計情報を計算できる数値型の評価指標データがありません。")
 
-    # 正確性レベル別の平均スコア
     st.write("##### 正確性レベル別の平均スコア")
-    if valid_stats_cols and '正確性' in analysis_df.columns:
+    if valid_stats_cols and '正確性ラベル' in analysis_df.columns:
         try:
-            accuracy_groups = analysis_df.groupby('正確性')[valid_stats_cols].mean()
-            st.dataframe(accuracy_groups)
-        except Exception as e:
-            st.warning(f"正確性別スコアの集計中にエラーが発生しました: {e}")
-    else:
-         st.info("正確性レベル別の平均スコアを計算できるデータがありません。")
+            grouped_stats = analysis_df.groupby('正確性ラベル')[valid_stats_cols].mean()
+            st.dataframe(grouped_stats)
+        except Exception as e: st.warning(f"正確性別スコアの集計中にエラーが発生しました: {e}")
+    else: st.info("正確性レベル別の平均スコアを計算できるデータがありません。")
 
-
-    # カスタム評価指標：効率性スコア
     st.write("##### 効率性スコア (正確性 / (応答時間 + 0.1))")
-    if 'response_time' in analysis_df.columns and analysis_df['response_time'].notna().any():
-        # ゼロ除算を避けるために0.1を追加
-        analysis_df['efficiency_score'] = analysis_df['is_correct'] / (analysis_df['response_time'].fillna(0) + 0.1)
-        # IDカラムが存在するか確認
-        if 'id' in analysis_df.columns:
-            # 上位10件を表示
-            top_efficiency = analysis_df.sort_values('efficiency_score', ascending=False).head(10)
-            # id をインデックスにする前に存在確認
-            if not top_efficiency.empty:
-                st.bar_chart(top_efficiency.set_index('id')['efficiency_score'])
-            else:
-                st.info("効率性スコアデータがありません。")
-        else:
-            # IDがない場合は単純にスコアを表示
-             st.bar_chart(analysis_df.sort_values('efficiency_score', ascending=False).head(10)['efficiency_score'])
+    if ('response_time' in analysis_df.columns and analysis_df['response_time'].notna().any() and
+        'is_correct' in analysis_df.columns and analysis_df['is_correct'].notna().any()):
+        analysis_df.loc[:, 'efficiency_score'] = analysis_df['is_correct'] / (analysis_df['response_time'].fillna(0) + 0.1)
+        top_efficiency = analysis_df.sort_values('efficiency_score', ascending=False).head(10)
+        if not top_efficiency.empty:
+            st.bar_chart(top_efficiency['efficiency_score'].reset_index(drop=True))
+        else: st.info("効率性スコアデータがありません。")
+    else: st.info("効率性スコアを計算するための応答時間または正確性データが不足しています。")
 
-    else:
-        st.info("効率性スコアを計算するための応答時間データがありません。")
-
-
-# --- サンプルデータ管理ページのUI ---
 def display_data_page():
-    """サンプルデータ管理ページのUIを表示する"""
     st.subheader("サンプル評価データの管理")
     count = get_db_count()
     st.write(f"現在のデータベースには {count} 件のレコードがあります。")
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("サンプルデータを追加", key="create_samples"):
+        if st.button("サンプルデータを追加", key="add_sample_data_page_btn"):
             create_sample_evaluation_data()
-            st.rerun() # 件数表示を更新
-
+            st.rerun()
     with col2:
-        # 確認ステップ付きのクリアボタン
-        if st.button("データベースをクリア", key="clear_db_button"):
-            if clear_db(): # clear_db内で確認と実行を行う
-                st.rerun() # クリア後に件数表示を更新
+        if st.button("データベースをクリア", key="clear_db_data_page_btn"):
+            if clear_db():
+                st.rerun()
 
-    # 評価指標に関する解説
     st.subheader("評価指標の説明")
     metrics_info = get_metrics_descriptions()
-    for metric, description in metrics_info.items():
-        with st.expander(f"{metric}"):
+    for metric_name, description in metrics_info.items():
+        with st.expander(f"{metric_name}"):
             st.write(description)
